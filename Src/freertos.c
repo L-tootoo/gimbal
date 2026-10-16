@@ -50,10 +50,11 @@
 osThreadId defaultTaskHandle;
 osThreadId ledtaskHandle;
 osThreadId buzzertaskHandle;
-osThreadId uarttaskHandle;
+osThreadId remotetaskHandle;
 osThreadId plottertaskHandle;
 osThreadId trajectorytaskHandle;
 osThreadId cantaskHandle;
+osThreadId imutaskHandle;
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -63,10 +64,11 @@ osThreadId cantaskHandle;
 void StartDefaultTask(void const * argument);
 extern void led_task(void const * argument);
 extern void buzzer_task(void const * argument);
-extern void uart_task(void const * argument);
+extern void remote_task(void const * argument);
 extern void plotter_task(void const * argument);
 extern void trajectory_task(void const * argument);
 extern void can_task(void const * argument);
+extern void imu_task(void const * argument);
 
 extern void MX_USB_DEVICE_Init(void);
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
@@ -126,9 +128,9 @@ void MX_FREERTOS_Init(void) {
   osThreadDef(buzzertask, buzzer_task, osPriorityNormal, 0, 256);
   buzzertaskHandle = osThreadCreate(osThread(buzzertask), NULL);
 
-  /* definition and creation of uarttask */
-  osThreadDef(uarttask, uart_task, osPriorityAboveNormal, 0, 256);
-  uarttaskHandle = osThreadCreate(osThread(uarttask), NULL);
+  /* definition and creation of remotetask */
+  osThreadDef(remotetask, remote_task, osPriorityAboveNormal, 0, 256);
+  remotetaskHandle = osThreadCreate(osThread(remotetask), NULL);
 
   /* definition and creation of plottertask */
   osThreadDef(plottertask, plotter_task, osPriorityNormal, 0, 256);
@@ -141,6 +143,10 @@ void MX_FREERTOS_Init(void) {
   /* definition and creation of cantask */
   osThreadDef(cantask, can_task, osPriorityNormal, 0, 512);
   cantaskHandle = osThreadCreate(osThread(cantask), NULL);
+
+  /* definition and creation of imutask */
+  osThreadDef(imutask, imu_task, osPriorityIdle, 0, 256);
+  imutaskHandle = osThreadCreate(osThread(imutask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */

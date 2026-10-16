@@ -3,7 +3,7 @@
 
 sp::DBus remote(&huart3);
 
-extern "C" void uart_task(void * argument)
+extern "C" void remote_task(void * argument)
 {
   remote.request();
 
