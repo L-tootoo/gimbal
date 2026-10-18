@@ -52,9 +52,9 @@ osThreadId ledtaskHandle;
 osThreadId buzzertaskHandle;
 osThreadId remotetaskHandle;
 osThreadId plottertaskHandle;
-osThreadId trajectorytaskHandle;
 osThreadId cantaskHandle;
 osThreadId imutaskHandle;
+osThreadId distancetaskHandle;
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -66,9 +66,9 @@ extern void led_task(void const * argument);
 extern void buzzer_task(void const * argument);
 extern void remote_task(void const * argument);
 extern void plotter_task(void const * argument);
-extern void trajectory_task(void const * argument);
 extern void can_task(void const * argument);
 extern void imu_task(void const * argument);
+extern void distance_task(void const * argument);
 
 extern void MX_USB_DEVICE_Init(void);
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
@@ -136,10 +136,6 @@ void MX_FREERTOS_Init(void) {
   osThreadDef(plottertask, plotter_task, osPriorityNormal, 0, 256);
   plottertaskHandle = osThreadCreate(osThread(plottertask), NULL);
 
-  /* definition and creation of trajectorytask */
-  osThreadDef(trajectorytask, trajectory_task, osPriorityNormal, 0, 256);
-  trajectorytaskHandle = osThreadCreate(osThread(trajectorytask), NULL);
-
   /* definition and creation of cantask */
   osThreadDef(cantask, can_task, osPriorityNormal, 0, 512);
   cantaskHandle = osThreadCreate(osThread(cantask), NULL);
@@ -147,6 +143,10 @@ void MX_FREERTOS_Init(void) {
   /* definition and creation of imutask */
   osThreadDef(imutask, imu_task, osPriorityIdle, 0, 256);
   imutaskHandle = osThreadCreate(osThread(imutask), NULL);
+
+  /* definition and creation of distancetask */
+  osThreadDef(distancetask, distance_task, osPriorityNormal, 0, 256);
+  distancetaskHandle = osThreadCreate(osThread(distancetask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */

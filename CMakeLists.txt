@@ -56,7 +56,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
    
     applications/plotter_task.cpp
     sp_middleware/io/plotter/plotter.cpp
-    applications/uart_task.cpp # <- 添加这一行
+    applications/remote_task.cpp # <- 添加这一行
     sp_middleware/io/dbus/dbus.cpp # <- 添加这一行
     applications/can_task.cpp # <- 添加这一行
     sp_middleware/io/can/can.cpp # <- 添加这一行
@@ -65,6 +65,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     sp_middleware/tools/joint/joint_controller.cpp
     sp_middleware/tools/math_tools/math_tools.cpp
     sp_middleware/tools/low_pass_filter/low_pass_filter.cpp
+
+    applications/distance_task.cpp
+
    
   
 )

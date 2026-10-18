@@ -1,16 +1,19 @@
 #include "cmsis_os.h"
-#include "io/bmi088/bmi088.hpp"
+#include "distance_task.hpp"
 #include "io/plotter/plotter.hpp"
 #include "usart.h"
 
-extern sp::BMI088 bmi088;
-
 sp::Plotter plotter(&huart1, false);
 
-extern "C" void plotter_task(void * argument)
+extern "C" void plotter_task(void const * argument)
 {
-  while (1) {
-    plotter.plot(bmi088.gyro[0], bmi088.gyro[1], bmi088.gyro[2]);
+  (void)argument;
+
+  while (true) {
+    DistanceStatus status{};
+    distance_get_status(&status);
+
+    plotter.plot(static_cast<float>(status.distance_cm));
 
     osDelay(10);
   }
