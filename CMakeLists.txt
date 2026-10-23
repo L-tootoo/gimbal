@@ -67,7 +67,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     sp_middleware/tools/low_pass_filter/low_pass_filter.cpp
 
     applications/distance_task.cpp
-
+    applications/trajectory_task.cpp
+applications/trajectory_task.cpp
+applications/track_task.cpp
+applications/grade_task.cpp
    
   
 )
@@ -76,6 +79,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     sp_middleware/
+    applicaitons/ # <- 添加这一行
 )
 
 # Add project symbols (macros)
