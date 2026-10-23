@@ -1,93 +1,52 @@
 #include <cmath>
 #include <cstdint>
 
+#include "FreeRTOS.h"
 #include "can.h"
 #include "cmsis_os.h"
 #include "io/can/can.hpp"
 #include "io/dbus/dbus.hpp"
 #include "motor/rm_motor/rm_motor.hpp"
+#include "task.h"
 #include "tools/pid/pid.hpp"
+#include "track_task.hpp"
 
 extern sp::DBus remote;
+// Pitch固定位置控制，角度rad，力矩N·m。
+// 以下PID及限幅为初始调试值。
+static constexpr float PITCH_HOLD_RAD = -0.2f;
+static constexpr float PITCH_PID_DT = 0.01f;
 
-// ==================== CAN 与电机 ====================
+static constexpr float PITCH_KP = 0.5f;
+static constexpr float PITCH_KI = 0.0f;
+static constexpr float PITCH_KD = 0.04f;
+
+static constexpr float PITCH_MAX_TORQUE = 0.15f;
+static constexpr float PITCH_MAX_INTEGRAL = 0.0f;
+
+static sp::PID pitch_pid(
+  PITCH_PID_DT, PITCH_KP, PITCH_KI, PITCH_KD, PITCH_MAX_TORQUE, PITCH_MAX_INTEGRAL);
+
+volatile float debug_pitch_target = PITCH_HOLD_RAD;
+volatile float debug_can_pitch_command = 0.0f;
+volatile bool debug_can_pitch_enabled = false;
+
+// ==================== CAN与电机 ====================
 
 sp::CAN can1(&hcan1);
 sp::CAN can2(&hcan2);
 
-// CAN1：Pitch GM6020，ID 1。
+// CAN1：Pitch GM6020，ID1。
 sp::RM_Motor pitch_motor(1, sp::RM_Motors::GM6020);
 
-// CAN2：Yaw GM6020，ID 2，只读取反馈。
-sp::RM_Motor yaw_motor(2, sp::RM_Motors::GM6020);
+// CAN2：Yaw GM6020，ID2，多圈反馈。
+sp::RM_Motor yaw_motor(2, sp::RM_Motors::GM6020, 1.0f, true);
 
-// CAN1：M2006，电调 ID 3，只读取反馈。
+// CAN1：Fold M2006，ID3。
+// 内部减速比由电机类处理。
 sp::RM_Motor fold_motor(3, sp::RM_Motors::M2006, sp::M2006_P36);
 
-// ==================== 控制参数 ====================
-
-static constexpr bool motor_output_enable = true;
-
-// 正常控制目标：本次测试 -1.4 rad。
-static constexpr float pitch_target_rad = -1.4f;
-
-// 水平参考：只用于重力补偿，不随目标一起修改。
-static constexpr float pitch_horizontal_rad = -1.6f;
-
-// 正常工作范围，单位 rad。
-static constexpr float pitch_min_rad = -1.95f;
-static constexpr float pitch_max_rad = -0.07f;
-
-// 轻微越界恢复范围。
-static constexpr float pitch_recovery_min_rad = -1.97f;
-static constexpr float pitch_recovery_max_rad = -0.05f;
-
-// 恢复到工作边界内侧 0.01 rad。
-static constexpr float pitch_recovery_margin_rad = 0.01f;
-
-static constexpr uint32_t pitch_recovery_timeout_ms = 1500;
-
-// 10 ms 任务周期。
-static constexpr float pid_dt = 0.01f;
-
-static constexpr float pitch_kp = 0.80f;
-static constexpr float pitch_ki = 0.0f;
-static constexpr float pitch_kd = 0.0f;
-
-// PID修正项限幅。
-static constexpr float pid_max_out = 0.25f;
-static constexpr float pid_max_iout = 0.0f;
-
-// PID、重力补偿、阻尼相加后的总限幅。
-static constexpr float pitch_command_max = 0.25f;
-
-// 重力补偿幅值，单位 N·m。
-static constexpr float gravity_torque_max = 0.21f;
-
-// 速度阻尼，单位 N·m/(rad/s)。
-static constexpr float pitch_damping = 0.02f;
-
-// ==================== PID ====================
-
-sp::PID pitch_pid(pid_dt, pitch_kp, pitch_ki, pitch_kd, pid_max_out, pid_max_iout);
-
-// ==================== 控制状态 ====================
-
-enum class PitchState
-{
-  disabled,
-  normal,
-  recover_lower,
-  recover_upper,
-  fault
-};
-
-static PitchState pitch_state = PitchState::disabled;
-
-static bool pitch_armed = false;
-static uint32_t recovery_start_tick = 0;
-
-// ==================== 调试变量 ====================
+// ==================== 接收调试变量 ====================
 
 volatile uint32_t can1_rx_count = 0;
 volatile uint32_t can2_rx_count = 0;
@@ -100,35 +59,32 @@ volatile uint32_t debug_can1_rx_id = 0;
 volatile uint32_t debug_can2_rx_id = 0;
 
 volatile bool debug_remote_alive = false;
-volatile bool debug_pitch_alive = false;
-volatile bool debug_pitch_enabled = false;
-volatile bool debug_pitch_limit_fault = false;
 
-volatile float debug_pitch_target = pitch_target_rad;
+volatile bool debug_pitch_alive = false;
+volatile bool debug_yaw_alive = false;
+volatile bool debug_fold_alive = false;
+
 volatile float debug_pitch_angle = 0.0f;
 volatile float debug_pitch_speed = 0.0f;
-volatile float debug_pitch_torque = 0.0f;
-volatile float debug_pitch_error = 0.0f;
 
-volatile float debug_pitch_pid_out = 0.0f;
-volatile float debug_pitch_gravity_comp = 0.0f;
-volatile float debug_pitch_damping = 0.0f;
-volatile float debug_pitch_command = 0.0f;
-
-// 0失能，1正常，2下边界恢复，3上边界恢复，4故障。
-volatile uint32_t debug_pitch_state = 0;
-
-volatile bool debug_yaw_alive = false;
 volatile float debug_yaw_angle = 0.0f;
 volatile float debug_yaw_speed = 0.0f;
 
-volatile bool debug_fold_alive = false;
 volatile float debug_fold_angle = 0.0f;
 volatile float debug_fold_speed = 0.0f;
+volatile float debug_fold_feedback_torque = 0.0f;
+
+// ==================== CAN输出调试变量 ====================
+
+volatile float debug_can_yaw_command = 0.0f;
+volatile bool debug_can_yaw_enabled = false;
+
+volatile float debug_can_fold_command = 0.0f;
+volatile bool debug_can_fold_enabled = false;
 
 // ==================== 辅助函数 ====================
 
-static float clamp_output(float value, float limit)
+static float clamp_torque(float value, float limit)
 {
   if (value > limit) {
     return limit;
@@ -141,70 +97,14 @@ static float clamp_output(float value, float limit)
   return value;
 }
 
-static bool angle_in_work_range(float angle)
+static void clear_buffer(uint8_t * data)
 {
-  return std::isfinite(angle) && angle >= pitch_min_rad && angle <= pitch_max_rad;
-}
-
-static bool angle_in_recovery_range(float angle)
-{
-  return std::isfinite(angle) && angle >= pitch_recovery_min_rad && angle <= pitch_recovery_max_rad;
-}
-
-static bool configuration_ok()
-{
-  return std::isfinite(pitch_recovery_min_rad) && std::isfinite(pitch_min_rad) &&
-         std::isfinite(pitch_max_rad) && std::isfinite(pitch_recovery_max_rad) &&
-         std::isfinite(pitch_horizontal_rad) && std::isfinite(pitch_recovery_margin_rad) &&
-         std::isfinite(gravity_torque_max) && std::isfinite(pitch_damping) &&
-         std::isfinite(pitch_command_max) && pitch_damping >= 0.0f && pitch_command_max > 0.0f &&
-         pitch_recovery_margin_rad > 0.0f && pitch_recovery_min_rad < pitch_min_rad &&
-         pitch_min_rad < pitch_max_rad && pitch_max_rad < pitch_recovery_max_rad &&
-         pitch_min_rad + pitch_recovery_margin_rad < pitch_max_rad - pitch_recovery_margin_rad &&
-         angle_in_work_range(pitch_target_rad);
-}
-
-static bool state_is_active()
-{
-  return pitch_state == PitchState::normal || pitch_state == PitchState::recover_lower ||
-         pitch_state == PitchState::recover_upper;
-}
-
-static void enter_fault()
-{
-  pitch_state = PitchState::fault;
-  pitch_armed = false;
-  pitch_pid.clear();
-}
-
-static void enter_recovery(PitchState new_state, uint32_t now)
-{
-  pitch_state = new_state;
-  recovery_start_tick = now;
-  pitch_pid.clear();
-}
-
-static uint32_t state_number()
-{
-  switch (pitch_state) {
-    case PitchState::disabled:
-      return 0;
-
-    case PitchState::normal:
-      return 1;
-
-    case PitchState::recover_lower:
-      return 2;
-
-    case PitchState::recover_upper:
-      return 3;
-
-    default:
-      return 4;
+  for (uint8_t i = 0; i < 8; ++i) {
+    data[i] = 0;
   }
 }
 
-// ==================== CAN 任务 ====================
+// ==================== CAN任务 ====================
 
 extern "C" void can_task(void const * argument)
 {
@@ -216,212 +116,174 @@ extern "C" void can_task(void const * argument)
   can2.config();
   can2.start();
 
-  const bool config_valid = configuration_ok();
-
   while (true) {
+    // 两个电机的控制结果均由track提供。
+    const TrackCommand track = track_read_command();
+
     const uint32_t now = osKernelSysTick();
 
-    const bool pitch_alive = pitch_motor.is_alive(osKernelSysTick());
+    float pitch_angle;
+    float pitch_speed;
 
-    const float pitch_angle = pitch_motor.angle;
-    const float pitch_speed = pitch_motor.speed;
+    float yaw_angle;
+    float yaw_speed;
 
-    const bool feedback_valid =
-      pitch_alive && std::isfinite(pitch_angle) && std::isfinite(pitch_speed);
+    float fold_angle;
+    float fold_speed;
+    float fold_feedback_torque;
 
-    const bool within_recovery = feedback_valid && angle_in_recovery_range(pitch_angle);
+    bool pitch_alive;
+    bool yaw_alive;
+    bool fold_alive;
 
-    const bool remote_alive = remote.is_alive(osKernelSysTick());
+    bool remote_alive;
+    sp::DBusSwitchMode right_switch;
 
-    const bool switch_up = remote_alive && remote.sw_r == sp::DBusSwitchMode::UP;
+    // ---------- 获取反馈快照 ----------
 
-    const bool switch_disabled = remote_alive && (remote.sw_r == sp::DBusSwitchMode::MID ||
-                                                  remote.sw_r == sp::DBusSwitchMode::DOWN);
+    taskENTER_CRITICAL();
 
-    // ---------- 遥控失能与启动 ----------
+    pitch_angle = pitch_motor.angle;
+    pitch_speed = pitch_motor.speed;
 
-    if (!config_valid) {
-      enter_fault();
-    }
-    else if (!remote_alive) {
-      // 重新连接后必须先经过中/下档。
-      pitch_state = PitchState::disabled;
-      pitch_armed = false;
-      pitch_pid.clear();
-    }
-    else if (switch_disabled) {
-      // 中/下档：零指令，并准备下一次上档启动。
-      pitch_state = PitchState::disabled;
-      pitch_pid.clear();
+    yaw_angle = yaw_motor.angle;
+    yaw_speed = yaw_motor.speed;
 
-      pitch_armed = within_recovery;
-    }
-    else if (!switch_up) {
-      pitch_state = PitchState::disabled;
-      pitch_armed = false;
-      pitch_pid.clear();
-    }
-    else if (!within_recovery) {
-      // 上档期间反馈异常或超出恢复范围。
-      enter_fault();
-    }
-    else if (pitch_state == PitchState::disabled && pitch_armed) {
-      pitch_armed = false;
-      pitch_pid.clear();
+    fold_angle = fold_motor.angle;
+    fold_speed = fold_motor.speed;
+    fold_feedback_torque = fold_motor.torque;
 
-      if (pitch_angle < pitch_min_rad) {
-        enter_recovery(PitchState::recover_lower, now);
-      }
-      else if (pitch_angle > pitch_max_rad) {
-        enter_recovery(PitchState::recover_upper, now);
-      }
-      else {
-        pitch_state = PitchState::normal;
-      }
+    pitch_alive = pitch_motor.is_alive(now);
+    yaw_alive = yaw_motor.is_alive(now);
+    fold_alive = fold_motor.is_alive(now);
+
+    remote_alive = remote.is_alive(now);
+    right_switch = remote.sw_r;
+
+    taskEXIT_CRITICAL();
+
+    const bool switch_up = remote_alive && right_switch == sp::DBusSwitchMode::UP;
+
+    const bool command_fresh = now - track.stamp_ms < 30U;
+
+    // ---------- Yaw独立输出检查 ----------
+
+    const bool yaw_enabled = switch_up && command_fresh && track.yaw_enabled && yaw_alive &&
+                             std::isfinite(yaw_angle) && std::isfinite(yaw_speed) &&
+                             std::isfinite(track.yaw);
+
+    float yaw_command = 0.0f;
+
+    if (yaw_enabled) {
+      yaw_command = clamp_torque(track.yaw, TRACK_YAW_TORQUE_LIMIT);
     }
 
-    // ---------- 恢复模式 ----------
+    // ---------- Fold独立输出检查 ----------
 
-    if (state_is_active()) {
-      if (pitch_state == PitchState::normal) {
-        if (pitch_angle < pitch_min_rad) {
-          enter_recovery(PitchState::recover_lower, now);
-        }
-        else if (pitch_angle > pitch_max_rad) {
-          enter_recovery(PitchState::recover_upper, now);
-        }
-      }
+    const bool fold_enabled = switch_up && command_fresh && track.fold_enabled && fold_alive &&
+                              std::isfinite(fold_angle) && std::isfinite(fold_speed) &&
+                              std::isfinite(track.fold);
 
-      if (pitch_state == PitchState::recover_lower) {
-        if (pitch_angle >= pitch_min_rad + pitch_recovery_margin_rad) {
-          pitch_state = PitchState::normal;
-          pitch_pid.clear();
-        }
-        else if (now - recovery_start_tick >= pitch_recovery_timeout_ms) {
-          enter_fault();
-        }
-      }
-      else if (pitch_state == PitchState::recover_upper) {
-        if (pitch_angle <= pitch_max_rad - pitch_recovery_margin_rad) {
-          pitch_state = PitchState::normal;
-          pitch_pid.clear();
-        }
-        else if (now - recovery_start_tick >= pitch_recovery_timeout_ms) {
-          enter_fault();
-        }
-      }
+    float fold_command = 0.0f;
+
+    if (fold_enabled) {
+      fold_command = clamp_torque(track.fold, TRACK_FOLD_TORQUE_LIMIT);
     }
 
-    // ---------- 当前控制目标 ----------
+    // ---------- 设置电机命令 ----------
 
-    float control_target = pitch_target_rad;
+    // Pitch继续零力矩。
+    // 右上档且track命令新鲜时，Pitch保持固定位置。
+    // 不依赖yaw或fold是否单独使能。
+    const bool pitch_enabled = switch_up && command_fresh && pitch_alive &&
+                               std::isfinite(pitch_angle) && std::isfinite(pitch_speed);
 
-    if (pitch_state == PitchState::recover_lower) {
-      control_target = pitch_min_rad + pitch_recovery_margin_rad;
-    }
-    else if (pitch_state == PitchState::recover_upper) {
-      control_target = pitch_max_rad - pitch_recovery_margin_rad;
-    }
-
-    const bool pitch_enabled = config_valid && switch_up && within_recovery && state_is_active() &&
-                               angle_in_work_range(control_target);
-
-    // ---------- PID、重力补偿、速度阻尼 ----------
-
-    float pid_output = 0.0f;
-    float gravity_comp = 0.0f;
-    float damping_torque = 0.0f;
     float pitch_command = 0.0f;
+    bool pitch_output_enabled = false;
 
-    if (motor_output_enable && pitch_enabled) {
-      pitch_pid.calc(control_target, pitch_angle);
-      pid_output = pitch_pid.out;
+    if (pitch_enabled) {
+      // 单位置环，D项使用实际速度阻尼。
+      pitch_pid.calc(PITCH_HOLD_RAD, pitch_angle, 0.0f, pitch_speed);
 
-      gravity_comp = gravity_torque_max * std::cos(pitch_angle - pitch_horizontal_rad);
+      if (std::isfinite(pitch_pid.out)) {
+        pitch_command = clamp_torque(pitch_pid.out, PITCH_MAX_TORQUE);
 
-      damping_torque = -pitch_damping * pitch_speed;
-
-      pitch_command = pid_output + gravity_comp + damping_torque;
-
-      if (!std::isfinite(pitch_command)) {
-        pitch_command = 0.0f;
-        enter_fault();
+        pitch_output_enabled = true;
       }
       else {
-        pitch_command = clamp_output(pitch_command, pitch_command_max);
-
-        // 下边界恢复：只允许正力矩。
-        if (pitch_state == PitchState::recover_lower && pitch_command < 0.0f) {
-          pitch_command = 0.0f;
-        }
-
-        // 上边界恢复：只允许负力矩。
-        if (pitch_state == PitchState::recover_upper && pitch_command > 0.0f) {
-          pitch_command = 0.0f;
-        }
+        pitch_pid.clear();
       }
     }
     else {
       pitch_pid.clear();
     }
 
-    if (!state_is_active()) {
-      pitch_command = 0.0f;
-    }
-
-    // ---------- 更新调试变量 ----------
-
-    debug_remote_alive = remote_alive;
-    debug_pitch_alive = pitch_alive;
-
-    debug_pitch_enabled = pitch_enabled && state_is_active();
-
-    debug_pitch_target = control_target;
-    debug_pitch_angle = pitch_angle;
-    debug_pitch_speed = pitch_speed;
-    debug_pitch_torque = pitch_motor.torque;
-    debug_pitch_error = control_target - pitch_angle;
-
-    debug_pitch_limit_fault = !config_valid || !feedback_valid ||
-                              !angle_in_work_range(pitch_angle) || pitch_state == PitchState::fault;
-
-    debug_pitch_pid_out = pid_output;
-    debug_pitch_gravity_comp = gravity_comp;
-    debug_pitch_damping = damping_torque;
-    debug_pitch_command = pitch_command;
-    debug_pitch_state = state_number();
-
-    debug_yaw_alive = yaw_motor.is_alive(osKernelSysTick());
-    debug_yaw_angle = yaw_motor.angle;
-    debug_yaw_speed = yaw_motor.speed;
-
-    debug_fold_alive = fold_motor.is_alive(osKernelSysTick());
-    debug_fold_angle = fold_motor.angle;
-    debug_fold_speed = fold_motor.speed;
-
-    // ---------- Pitch CAN1 输出 ----------
-
-    // 失能或故障时，也持续发送零指令。
     pitch_motor.cmd(pitch_command);
 
-    for (uint8_t i = 0; i < 8; ++i) {
-      can1.tx_data[i] = 0;
-    }
+    debug_pitch_target = PITCH_HOLD_RAD;
+    debug_can_pitch_command = pitch_command;
+    debug_can_pitch_enabled = pitch_output_enabled;
 
+    // Yaw与fold分别使用各自命令。
+    yaw_motor.cmd(yaw_command);
+    fold_motor.cmd(fold_command);
+
+    // ---------- CAN1：Pitch ----------
+    // GM6020 ID1。
+
+    clear_buffer(can1.tx_data);
     pitch_motor.write(can1.tx_data);
     can1.send(pitch_motor.tx_id);
 
-    // Yaw、M2006只读取反馈。
+    // ---------- CAN1：Fold ----------
+    // M2006 ID3，与Pitch使用不同控制帧。
+
+    clear_buffer(can1.tx_data);
+    fold_motor.write(can1.tx_data);
+    can1.send(fold_motor.tx_id);
+
+    // ---------- CAN2：Yaw ----------
+    // GM6020 ID2。
+
+    clear_buffer(can2.tx_data);
+    yaw_motor.write(can2.tx_data);
+    can2.send(yaw_motor.tx_id);
+
+    // ---------- 更新反馈调试变量 ----------
+
+    debug_remote_alive = remote_alive;
+
+    debug_pitch_alive = pitch_alive;
+    debug_yaw_alive = yaw_alive;
+    debug_fold_alive = fold_alive;
+
+    debug_pitch_angle = pitch_angle;
+    debug_pitch_speed = pitch_speed;
+
+    debug_yaw_angle = yaw_angle;
+    debug_yaw_speed = yaw_speed;
+
+    debug_fold_angle = fold_angle;
+    debug_fold_speed = fold_speed;
+    debug_fold_feedback_torque = fold_feedback_torque;
+
+    // ---------- 更新CAN输出调试变量 ----------
+
+    debug_can_yaw_command = yaw_command;
+    debug_can_yaw_enabled = yaw_enabled;
+
+    debug_can_fold_command = fold_command;
+    debug_can_fold_enabled = fold_enabled;
 
     osDelay(10);
   }
 }
 
-// ==================== CAN 接收回调 ====================
+// ==================== CAN接收回调 ====================
 
 extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef * hcan)
 {
-  const uint32_t stamp_ms = osKernelSysTick();
+  const uint32_t now = osKernelSysTick();
 
   while (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) > 0) {
     if (hcan == &hcan1) {
@@ -431,11 +293,11 @@ extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef * hcan)
       debug_can1_rx_id = can1.rx_id;
 
       if (can1.rx_id == pitch_motor.rx_id) {
-        pitch_motor.read(can1.rx_data, stamp_ms);
+        pitch_motor.read(can1.rx_data, now);
         ++pitch_rx_count;
       }
       else if (can1.rx_id == fold_motor.rx_id) {
-        fold_motor.read(can1.rx_data, stamp_ms);
+        fold_motor.read(can1.rx_data, now);
         ++fold_rx_count;
       }
     }
@@ -446,7 +308,7 @@ extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef * hcan)
       debug_can2_rx_id = can2.rx_id;
 
       if (can2.rx_id == yaw_motor.rx_id) {
-        yaw_motor.read(can2.rx_data, stamp_ms);
+        yaw_motor.read(can2.rx_data, now);
         ++yaw_rx_count;
       }
     }

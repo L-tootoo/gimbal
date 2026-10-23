@@ -2,6 +2,7 @@
 #include "io/bmi088/bmi088.hpp"
 #include "spi.h"
 #include "tools/mahony/mahony.hpp"
+#include "track_task.hpp"
 
 const float r_ab[3][3] = {{0.0f, -1.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}};
 
@@ -15,6 +16,7 @@ extern "C" void imu_task(void * argument)
   while (1) {
     bmi088.update();
     mahony.update(bmi088.acc, bmi088.gyro);
+    track_publish_imu(mahony.yaw, mahony.pitch);
 
     osDelay(1);
   }

@@ -55,6 +55,9 @@ osThreadId plottertaskHandle;
 osThreadId cantaskHandle;
 osThreadId imutaskHandle;
 osThreadId distancetaskHandle;
+osThreadId trajectorytaskHandle;
+osThreadId tracktaskHandle;
+osThreadId gradetaskHandle;
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -69,6 +72,9 @@ extern void plotter_task(void const * argument);
 extern void can_task(void const * argument);
 extern void imu_task(void const * argument);
 extern void distance_task(void const * argument);
+extern void trajectory_task(void const * argument);
+extern void track_task(void const * argument);
+extern void grade_task(void const * argument);
 
 extern void MX_USB_DEVICE_Init(void);
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
@@ -147,6 +153,18 @@ void MX_FREERTOS_Init(void) {
   /* definition and creation of distancetask */
   osThreadDef(distancetask, distance_task, osPriorityNormal, 0, 256);
   distancetaskHandle = osThreadCreate(osThread(distancetask), NULL);
+
+  /* definition and creation of trajectorytask */
+  osThreadDef(trajectorytask, trajectory_task, osPriorityNormal, 0, 256);
+  trajectorytaskHandle = osThreadCreate(osThread(trajectorytask), NULL);
+
+  /* definition and creation of tracktask */
+  osThreadDef(tracktask, track_task, osPriorityNormal, 0, 256);
+  tracktaskHandle = osThreadCreate(osThread(tracktask), NULL);
+
+  /* definition and creation of gradetask */
+  osThreadDef(gradetask, grade_task, osPriorityBelowNormal, 0, 256);
+  gradetaskHandle = osThreadCreate(osThread(gradetask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
