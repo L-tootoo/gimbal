@@ -18,6 +18,8 @@ static constexpr uint16_t frame_buf_size = 13;
 static constexpr uint8_t queue_length = 8;
 
 static constexpr uint32_t distance_timeout_ticks = pdMS_TO_TICKS(500);
+// 查询周期：保留原测量模式，给两次测量之间留出空闲时间。
+static constexpr uint32_t distance_query_period_ticks = pdMS_TO_TICKS(400);
 
 struct DistanceRxMessage
 {
@@ -51,6 +53,7 @@ volatile uint32_t distance_uart_error_count = 0;
 volatile uint32_t distance_start_status = 0;
 volatile uint32_t distance_uart_error_code = 0;
 volatile uint32_t distance_dma_error_code = 0;
+volatile uint32_t distance_query_fail_count = 0;
 
 // ==================== 状态接口 ====================
 
@@ -323,6 +326,10 @@ extern "C" void distance_task(void * argument)
   }
 
   DistanceRxMessage message{};
+
+  // GY-56 查询输出：A5 + 65 + 02，校验和取低8位为0C。
+  const uint8_t query_command[] = {0xA5, 0x65, 0x02, 0x0C};
+  uint32_t last_query_tick = osKernelSysTick() - distance_query_period_ticks;
 
   // 首次启动也经过统一恢复流程。
   recovery_requested = true;
