@@ -4,6 +4,7 @@
 #include "FreeRTOS.h"
 #include "can.h"
 #include "cmsis_os.h"
+#include "distance_task.hpp"
 #include "io/can/can.hpp"
 #include "io/dbus/dbus.hpp"
 #include "motor/rm_motor/rm_motor.hpp"
@@ -14,22 +15,51 @@
 extern sp::DBus remote;
 // Pitch固定位置控制，角度rad，力矩N·m。
 // 以下PID及限幅为初始调试值。
-static constexpr float PITCH_HOLD_RAD = -0.2f;
+static constexpr float PITCH_HOLD_RAD = -0.15f;
+static constexpr float PITCH_FOLD_HOLD_RAD = -0.1f;
+static constexpr float PITCH_FOLD_NEAR_RAD = -1.5f;
+static constexpr uint16_t PITCH_TRIGGER_DISTANCE_CM = 30U;
+static constexpr uint32_t PITCH_FOLD_HOLD_MS = 1000U;
+static constexpr uint32_t PITCH_FOLD_SETTLE_MS = 100U;
+static constexpr float PITCH_FOLD_ARRIVAL_ERROR_RAD = 0.05f;
+static constexpr float PITCH_FOLD_ARRIVAL_SPEED_RAD_S = 0.20f;
 static constexpr float PITCH_PID_DT = 0.01f;
 
 static constexpr float PITCH_KP = 0.5f;
 static constexpr float PITCH_KI = 0.0f;
 static constexpr float PITCH_KD = 0.04f;
 
-static constexpr float PITCH_MAX_TORQUE = 0.15f;
+static constexpr float PITCH_MAX_TORQUE = 0.8f;
 static constexpr float PITCH_MAX_INTEGRAL = 0.0f;
+
+// 重力补偿：质量kg，重心到转轴距离m，力矩N*m。
+static constexpr float PITCH_LOAD_MASS_KG = 0.08f;
+static constexpr float PITCH_COM_DISTANCE_M = 0.08f;
+static constexpr float PITCH_GRAVITY_MAX = PITCH_LOAD_MASS_KG * 9.81f * PITCH_COM_DISTANCE_M;
+// 水平参考采用本次上传参数-1.4rad；补偿方向为正，需与实物一致。
+static constexpr float PITCH_HORIZONTAL_RAD = -1.4f;
+static constexpr float PITCH_GRAVITY_SIGN = 1.0f;
 
 static sp::PID pitch_pid(
   PITCH_PID_DT, PITCH_KP, PITCH_KI, PITCH_KD, PITCH_MAX_TORQUE, PITCH_MAX_INTEGRAL);
 
 volatile float debug_pitch_target = PITCH_HOLD_RAD;
 volatile float debug_can_pitch_command = 0.0f;
+volatile float debug_pitch_gravity = 0.0f;
+volatile float debug_pitch_raw_torque = 0.0f;
 volatile bool debug_can_pitch_enabled = false;
+
+// 中档使用独立位置保持PID，不改变上档track任务的参数和状态。
+static sp::PID fold_mode_yaw_pid(0.01f, 0.45f, 0.12f, 0.015f, TRACK_YAW_TORQUE_LIMIT, 0.5f);
+static sp::PID fold_mode_fold_pid(0.01f, 0.6f, 0.07f, 0.02f, TRACK_FOLD_TORQUE_LIMIT, 0.1f);
+volatile float debug_fold_mode_yaw_target = 0.0f;
+volatile float debug_fold_mode_fold_target = 0.0f;
+volatile bool debug_fold_mode_active = false;
+volatile bool debug_pitch_distance_valid = false;
+volatile float debug_pitch_distance_cm = -1.0f;
+volatile bool debug_pitch_near = false;
+// 0待机/返回，1前往折叠位置，2到位保持。
+volatile uint32_t debug_pitch_fold_state = 0U;
 
 // ==================== CAN与电机 ====================
 
@@ -116,8 +146,26 @@ extern "C" void can_task(void const * argument)
   can2.config();
   can2.start();
 
+  enum class PitchFoldState
+  {
+    idle,
+    approaching,
+    holding
+  };
+  PitchFoldState pitch_fold_state = PitchFoldState::idle;
+  bool pitch_trigger_armed = true;
+  bool pitch_settling = false;
+  uint32_t pitch_settle_start = 0U;
+  uint32_t pitch_hold_start = 0U;
+  bool was_middle = false;
+  bool was_up = false;
+  bool middle_yaw_ready = false;
+  bool middle_fold_ready = false;
+  float middle_yaw_target = 0.0f;
+  float middle_fold_target = 0.0f;
+
   while (true) {
-    // 两个电机的控制结果均由track提供。
+    // 上档使用track命令，中档使用CAN任务内的固定位置控制。
     const TrackCommand track = track_read_command();
 
     const uint32_t now = osKernelSysTick();
@@ -164,13 +212,102 @@ extern "C" void can_task(void const * argument)
 
     const bool switch_up = remote_alive && right_switch == sp::DBusSwitchMode::UP;
 
+    const bool switch_middle = remote_alive && right_switch == sp::DBusSwitchMode::MID;
     const bool command_fresh = now - track.stamp_ms < 30U;
+    const bool yaw_feedback_valid =
+      yaw_alive && std::isfinite(yaw_angle) && std::isfinite(yaw_speed);
+    const bool fold_feedback_valid =
+      fold_alive && std::isfinite(fold_angle) && std::isfinite(fold_speed);
+
+    if (switch_middle && !was_middle) {
+      // 仅在进入中档时记录一次；测距触发不会重建Yaw/Fold目标。
+      middle_yaw_target = yaw_angle;
+      middle_fold_target = fold_angle;
+      middle_yaw_ready = yaw_feedback_valid;
+      middle_fold_ready = fold_feedback_valid;
+      fold_mode_yaw_pid.clear();
+      fold_mode_fold_pid.clear();
+    }
+    if (!switch_middle) {
+      middle_yaw_ready = false;
+      middle_fold_ready = false;
+      fold_mode_yaw_pid.clear();
+      fold_mode_fold_pid.clear();
+    }
+    // 中档反馈中断后停止该轴，重新拨档才能重新建立保持参考。
+    if (!yaw_feedback_valid) middle_yaw_ready = false;
+    if (!fold_feedback_valid) middle_fold_ready = false;
+    const bool middle_entered = switch_middle && !was_middle;
+    if (switch_middle != was_middle || switch_up != was_up) pitch_pid.clear();
+    was_middle = switch_middle;
+    was_up = switch_up;
+
+    DistanceStatus distance{};
+    const bool distance_valid = distance_get_status(&distance) && distance.valid;
+    const bool near =
+      switch_middle && distance_valid && distance.distance_cm < PITCH_TRIGGER_DISTANCE_CM;
+    const bool pitch_feedback_valid =
+      pitch_alive && std::isfinite(pitch_angle) && std::isfinite(pitch_speed);
+    if (!switch_middle || middle_entered) {
+      pitch_fold_state = PitchFoldState::idle;
+      pitch_trigger_armed = true;
+      pitch_settling = false;
+    }
+    if (switch_middle) {
+      if (!pitch_feedback_valid) {
+        pitch_fold_state = PitchFoldState::idle;
+        pitch_settling = false;
+        pitch_trigger_armed = false;
+      }
+      else if (pitch_fold_state == PitchFoldState::idle) {
+        // 只用有效的远距离重新武装，测距丢失不会造成再次触发。
+        if (distance_valid && distance.distance_cm >= PITCH_TRIGGER_DISTANCE_CM) {
+          pitch_trigger_armed = true;
+        }
+        if (near && pitch_trigger_armed) {
+          pitch_fold_state = PitchFoldState::approaching;
+          pitch_trigger_armed = false;
+          pitch_settling = false;
+        }
+      }
+      else if (pitch_fold_state == PitchFoldState::approaching) {
+        const bool arrived =
+          std::fabs(pitch_angle - PITCH_FOLD_NEAR_RAD) < PITCH_FOLD_ARRIVAL_ERROR_RAD &&
+          std::fabs(pitch_speed) < PITCH_FOLD_ARRIVAL_SPEED_RAD_S;
+        if (!arrived) {
+          pitch_settling = false;
+        }
+        else if (!pitch_settling) {
+          pitch_settling = true;
+          pitch_settle_start = now;
+        }
+        else if (now - pitch_settle_start >= PITCH_FOLD_SETTLE_MS) {
+          pitch_fold_state = PitchFoldState::holding;
+          pitch_hold_start = now;
+        }
+      }
+      else if (now - pitch_hold_start >= PITCH_FOLD_HOLD_MS) {
+        pitch_fold_state = PitchFoldState::idle;
+        pitch_settling = false;
+      }
+    }
+    const float pitch_target =
+      switch_middle
+        ? (pitch_fold_state != PitchFoldState::idle ? PITCH_FOLD_NEAR_RAD : PITCH_FOLD_HOLD_RAD)
+        : PITCH_HOLD_RAD;
+    debug_pitch_fold_state = static_cast<uint32_t>(pitch_fold_state);
+    debug_fold_mode_active = switch_middle;
+    debug_fold_mode_yaw_target = middle_yaw_target;
+    debug_fold_mode_fold_target = middle_fold_target;
+    debug_pitch_distance_valid = distance_valid;
+    debug_pitch_distance_cm = distance_valid ? static_cast<float>(distance.distance_cm) : -1.0f;
+    debug_pitch_near = near;
 
     // ---------- Yaw独立输出检查 ----------
 
-    const bool yaw_enabled = switch_up && command_fresh && track.yaw_enabled && yaw_alive &&
-                             std::isfinite(yaw_angle) && std::isfinite(yaw_speed) &&
-                             std::isfinite(track.yaw);
+    bool yaw_enabled = switch_up && command_fresh && track.yaw_enabled && yaw_alive &&
+                       std::isfinite(yaw_angle) && std::isfinite(yaw_speed) &&
+                       std::isfinite(track.yaw);
 
     float yaw_command = 0.0f;
 
@@ -180,9 +317,9 @@ extern "C" void can_task(void const * argument)
 
     // ---------- Fold独立输出检查 ----------
 
-    const bool fold_enabled = switch_up && command_fresh && track.fold_enabled && fold_alive &&
-                              std::isfinite(fold_angle) && std::isfinite(fold_speed) &&
-                              std::isfinite(track.fold);
+    bool fold_enabled = switch_up && command_fresh && track.fold_enabled && fold_alive &&
+                        std::isfinite(fold_angle) && std::isfinite(fold_speed) &&
+                        std::isfinite(track.fold);
 
     float fold_command = 0.0f;
 
@@ -190,23 +327,58 @@ extern "C" void can_task(void const * argument)
       fold_command = clamp_torque(track.fold, TRACK_FOLD_TORQUE_LIMIT);
     }
 
+    // ---------- 中档：Yaw/Fold固定位置，保留实际速度阻尼 ----------
+    if (switch_middle) {
+      yaw_enabled = false;
+      fold_enabled = false;
+      yaw_command = 0.0f;
+      fold_command = 0.0f;
+      if (middle_yaw_ready) {
+        fold_mode_yaw_pid.calc(middle_yaw_target, yaw_angle, 0.0f, yaw_speed);
+        if (std::isfinite(fold_mode_yaw_pid.out)) {
+          yaw_command = clamp_torque(fold_mode_yaw_pid.out, TRACK_YAW_TORQUE_LIMIT);
+          yaw_enabled = true;
+        }
+        else
+          middle_yaw_ready = false;
+      }
+      if (middle_fold_ready) {
+        fold_mode_fold_pid.calc(middle_fold_target, fold_angle, 0.0f, fold_speed);
+        if (std::isfinite(fold_mode_fold_pid.out)) {
+          fold_command = clamp_torque(fold_mode_fold_pid.out, TRACK_FOLD_TORQUE_LIMIT);
+          fold_enabled = true;
+        }
+        else
+          middle_fold_ready = false;
+      }
+      if (!middle_yaw_ready) fold_mode_yaw_pid.clear();
+      if (!middle_fold_ready) fold_mode_fold_pid.clear();
+    }
+
     // ---------- 设置电机命令 ----------
 
-    // Pitch继续零力矩。
-    // 右上档且track命令新鲜时，Pitch保持固定位置。
-    // 不依赖yaw或fold是否单独使能。
-    const bool pitch_enabled = switch_up && command_fresh && pitch_alive &&
-                               std::isfinite(pitch_angle) && std::isfinite(pitch_speed);
+    // 中档折叠独立运行；上档继续要求track命令新鲜。
+    const bool pitch_mode_enabled = switch_middle || (switch_up && command_fresh);
+    const bool pitch_enabled =
+      pitch_mode_enabled && pitch_alive && std::isfinite(pitch_angle) && std::isfinite(pitch_speed);
 
     float pitch_command = 0.0f;
     bool pitch_output_enabled = false;
+    debug_pitch_gravity = 0.0f;
+    debug_pitch_raw_torque = 0.0f;
 
     if (pitch_enabled) {
       // 单位置环，D项使用实际速度阻尼。
-      pitch_pid.calc(PITCH_HOLD_RAD, pitch_angle, 0.0f, pitch_speed);
+      pitch_pid.calc(pitch_target, pitch_angle, 0.0f, pitch_speed);
 
-      if (std::isfinite(pitch_pid.out)) {
-        pitch_command = clamp_torque(pitch_pid.out, PITCH_MAX_TORQUE);
+      const float gravity =
+        PITCH_GRAVITY_SIGN * PITCH_GRAVITY_MAX * std::cos(pitch_angle - PITCH_HORIZONTAL_RAD);
+      const float raw_torque = pitch_pid.out + gravity;
+
+      if (std::isfinite(raw_torque)) {
+        debug_pitch_gravity = gravity;
+        debug_pitch_raw_torque = raw_torque;
+        pitch_command = clamp_torque(raw_torque, PITCH_MAX_TORQUE);
 
         pitch_output_enabled = true;
       }
@@ -220,7 +392,7 @@ extern "C" void can_task(void const * argument)
 
     pitch_motor.cmd(pitch_command);
 
-    debug_pitch_target = PITCH_HOLD_RAD;
+    debug_pitch_target = pitch_target;
     debug_can_pitch_command = pitch_command;
     debug_can_pitch_enabled = pitch_output_enabled;
 
